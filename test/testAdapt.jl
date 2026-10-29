@@ -255,14 +255,19 @@ custom_point_transform(x::Tuple) = map(custom_point_transform, x)
           @test adjoint_result ≈ adjoint(source) * y rtol=1f-4 atol=1f-5
 
           if shift && unitary
-            # Distinct children: DiagOp runs them in parallel, and one FFTOp
-            # shares its plan and buffer across calls.
-            compound = DiagOp((source, copy(source)))
+            compound = DiagOp((source, source))
             compound_adapted = Adapt.adapt(array_type, compound)
             @test all(typeof(child.Mv) <: array_type for child in compound_adapted.ops)
             @test all(child.plan !== source.plan for child in compound_adapted.ops)
+            first_child, second_child = compound_adapted.ops
+            @test first_child !== second_child
+            @test first_child.plan !== second_child.plan
+            @test first_child.Mv !== second_child.Mv
             z = randn(ComplexF32, 96)
-            @test Array(compound_adapted * array_type(z)) ≈ compound * z rtol=1f-4 atol=1f-5
+            # The repeated source child races when DiagOp runs both blocks in
+            # parallel, so the reference applies it to each block in turn.
+            reference = vcat(source * z[1:48], source * z[49:96])
+            @test Array(compound_adapted * array_type(z)) ≈ reference rtol=1f-4 atol=1f-5
 
             round_trip = Adapt.adapt(Array, adapted)
             @test round_trip !== adapted
