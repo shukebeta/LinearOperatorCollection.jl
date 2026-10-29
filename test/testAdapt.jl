@@ -255,7 +255,9 @@ custom_point_transform(x::Tuple) = map(custom_point_transform, x)
           @test adjoint_result ≈ adjoint(source) * y rtol=1f-4 atol=1f-5
 
           if shift && unitary
-            compound = DiagOp((source, source))
+            # Distinct children: DiagOp runs them in parallel, and one FFTOp
+            # shares its plan and buffer across calls.
+            compound = DiagOp((source, copy(source)))
             compound_adapted = Adapt.adapt(array_type, compound)
             @test all(typeof(child.Mv) <: array_type for child in compound_adapted.ops)
             @test all(child.plan !== source.plan for child in compound_adapted.ops)
@@ -421,6 +423,91 @@ custom_point_transform(x::Tuple) = map(custom_point_transform, x)
           @test adapted.fftplan !== source_normal.fftplan
         end
       end
+
+      @testset "RadonOp" begin
+        N = 16
+        angle_range = range(0f0, Float32(π), 12)
+        default_geometry = RadonParallelCircle(N, -(N - 1) ÷ 2:(N - 1) ÷ 2)
+        in_height = -(N ÷ 4):(N ÷ 4)
+        geometry = RadonParallelCircle(N, in_height,
+                                       Float32.(1 .+ 0.5 .* rand(length(in_height))))
+        cases = (
+          (name = "2-D non-default geometry", shape = (N, N),
+           angles = collect(angle_range), geometry = geometry, μ = nothing),
+          (name = "3-D with range angles", shape = (N, N, 3),
+           angles = angle_range, geometry = default_geometry, μ = nothing),
+          (name = "array μ", shape = (N, N), angles = collect(angle_range),
+           geometry = default_geometry, μ = 0.02f0 .* rand(Float32, N, N)),
+          (name = "scalar μ", shape = (N, N), angles = collect(angle_range),
+           geometry = default_geometry, μ = 0.01f0),
+        )
+
+        for case in cases
+          @testset "$(case.name)" begin
+            source = RadonOp(Float32; shape = case.shape, angles = case.angles,
+                             geometry = case.geometry, μ = case.μ, S = Vector{Float32})
+            source_angles = copy(case.angles)
+            source_μ = case.μ isa AbstractArray ? copy(case.μ) : case.μ
+            adapted = Adapt.adapt(array_type, source)
+
+            @test adapted !== source
+            @test adapted.Mv !== source.Mv
+            @test adapted.Mtu !== source.Mtu
+            check_adapted_storage(adapted, array_type)
+            @test typeof(adapted.Mtu) <: array_type
+            @test size(adapted) == size(source)
+            @test adapted.shape == source.shape == case.shape
+            @test adapted.geometry === source.geometry
+            if case.angles isa AbstractRange
+              @test adapted.angles === case.angles
+            else
+              @test typeof(adapted.angles) <: array_type
+            end
+            if case.μ isa AbstractArray
+              @test typeof(adapted.μ) <: array_type
+            else
+              @test adapted.μ === case.μ
+            end
+            @test source.angles == source_angles
+            @test source.μ == source_μ
+
+            x = rand(Float32, prod(case.shape))
+            y = rand(Float32, size(source, 1))
+            if case.geometry === geometry
+              # The narrowed detector changes the sinogram size, and the
+              # products must match RadonKA called with the same geometry.
+              @test size(source, 1) == length(in_height) * length(case.angles)
+              @test length(in_height) != length(default_geometry.in_height)
+              @test source * x ≈ vec(radon(reshape(x, case.shape), case.angles; geometry)) rtol = 1f-5
+              @test adjoint(source) * y ≈ vec(backproject(reshape(y, length(in_height), :),
+                                                          case.angles; geometry)) rtol = 1f-5
+            end
+
+            if array_type === JLArray
+              # RadonKA calls KernelAbstractions.synchronize, which the
+              # JLArrays backend does not implement.
+              @test_broken Array(adapted * array_type(x)) ≈ source * x rtol = 1f-5
+              @test_broken Array(adjoint(adapted) * array_type(y)) ≈ adjoint(source) * y rtol = 1f-5
+            else
+              @test Array(adapted * array_type(x)) ≈ source * x rtol = 1f-5
+              @test Array(adjoint(adapted) * array_type(y)) ≈ adjoint(source) * y rtol = 1f-5
+            end
+
+            # A different backend copies mutable configuration arrays, so
+            # later source mutation does not reach the adapted operator.
+            if array_type !== Array
+              if !(case.angles isa AbstractRange)
+                source.angles .+= 1
+                @test Array(adapted.angles) == source_angles
+              end
+              if case.μ isa AbstractArray
+                source.μ .+= 1
+                @test Array(adapted.μ) == source_μ
+              end
+            end
+          end
+        end
+      end
     end
   end
 
@@ -460,11 +547,13 @@ struct UnsupportedAdaptTarget end
   toeplitz = with(nfft_backend => NFFT.backend()) do
     normalOperator(nfft)
   end
+  radon_op = RadonOp(Float32; shape=(8, 8), angles=collect(range(0f0, Float32(π), 4)))
 
   for target in (UnsupportedAdaptTarget, AbstractVector)
     @test_throws ArgumentError Adapt.adapt(target, fft)
     @test_throws ArgumentError Adapt.adapt(target, nfft)
     @test_throws ArgumentError Adapt.adapt(target, toeplitz)
+    @test_throws ArgumentError Adapt.adapt(target, radon_op)
   end
 end
 
